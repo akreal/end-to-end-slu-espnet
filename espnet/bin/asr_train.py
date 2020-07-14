@@ -72,6 +72,8 @@ def get_parser():
                         help='Apply label smoothing with a specified distribution type')
     parser.add_argument('--lsm-weight', default=0.0, type=float,
                         help='Label smoothing weight')
+    parser.add_argument('--slu-loss', default=None, type=str,
+                        help='Function to calculate NLU-SLU distance (e.g. cosine_embedding_loss).')
     # recognition options to compute CER/WER
     parser.add_argument('--report-cer', default=False, action='store_true',
                         help='Compute CER on development set')
@@ -165,6 +167,8 @@ def get_parser():
     # speech translation related
     parser.add_argument('--context-residual', default=False, type=strtobool, nargs='?',
                         help='The flag to switch to use context vector residual in the decoder network')
+    parser.add_argument('--slu-model', default=False, nargs='?',
+                        help='Pre-trained NLU model (e.g. bert-base-uncased)')
     parser.add_argument('--asr-model', default=None, type=str, nargs='?',
                         help='Pre-trained ASR model')
     parser.add_argument('--mt-model', default=None, type=str, nargs='?',
@@ -243,6 +247,11 @@ def get_parser():
                         help='')
     parser.add_argument('--fbank-fmax', type=float, default=None,
                         help='')
+    # SLU
+    parser.add_argument('--slu-tune-weights', default='', type=str,
+                    help="Tune weights from pre-trained models, n closest to the mapping layer (e.g. asr1+slu1)")
+    parser.add_argument('--slu-pooling', default='', type=str,
+                    help="Pooling on the NLU input")
     return parser
 
 
@@ -281,7 +290,7 @@ def main(cmd_args):
     if args.ngpu is None:
         cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
         if cvd is not None:
-            ngpu = len(cvd.split(','))
+            args.ngpu = len(cvd.split(','))
         else:
             logging.warning("CUDA_VISIBLE_DEVICES is not set.")
             try:
@@ -289,12 +298,10 @@ def main(cmd_args):
                                    stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE)
             except (subprocess.CalledProcessError, FileNotFoundError):
-                ngpu = 0
+                args.ngpu = 0
             else:
-                ngpu = len(p.stderr.decode().split('\n')) - 1
-    else:
-        ngpu = args.ngpu
-    logging.info(f"ngpu: {ngpu}")
+                args.ngpu = len(p.stderr.decode().split('\n')) - 1
+    logging.info(f"ngpu: {args.ngpu}")
 
     # display PYTHONPATH
     logging.info('python path = ' + os.environ.get('PYTHONPATH', '(None)'))

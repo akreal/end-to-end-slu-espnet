@@ -35,6 +35,8 @@ import espnet.lm.pytorch_backend.lm as lm_pytorch
 from espnet.nets.asr_interface import ASRInterface
 from espnet.nets.mt_interface import MTInterface
 from espnet.nets.pytorch_backend.e2e_asr import pad_list
+from espnet.nets.pytorch_backend.nets_utils import to_device
+from espnet.nets.pytorch_backend.nets_utils import to_torch_tensor
 from espnet.nets.pytorch_backend.streaming.segment import SegmentStreamingE2E
 from espnet.nets.pytorch_backend.streaming.window import WindowStreamingE2E
 from espnet.transform.spectrogram import IStft
@@ -245,7 +247,7 @@ class CustomConverter(object):
 
         ilens = torch.from_numpy(ilens).to(device)
         # NOTE: this is for multi-task learning (e.g., speech translation)
-        ys_pad = pad_list([torch.from_numpy(np.array(y[0]) if isinstance(y, tuple) else y).long()
+        ys_pad = pad_list([torch.from_numpy(np.array(y[0]) if isinstance(y, tuple) else y)
                            for y in ys], self.ignore_id).to(device)
 
         return xs_pad, ilens, ys_pad
@@ -271,6 +273,13 @@ def load_trained_model(model_path):
         model_module = "espnet.nets.pytorch_backend.e2e_asr:E2E"
     model_class = dynamic_import(model_module)
     model = model_class(idim, odim, train_args)
+
+    if hasattr(train_args, "slu_model") and train_args.slu_model and train_args.slu_loss:
+        if hasattr(train_args, 'slu_pooling'):
+            model.add_slu(train_args.slu_model, train_args.slu_loss, train_args.slu_tune_weights, train_args.slu_pooling)
+        else:
+            model.add_slu(train_args.slu_model, train_args.slu_loss, train_args.slu_tune_weights, '')
+
     torch_load(model_path, model)
 
     return model, train_args
@@ -327,6 +336,8 @@ def train(args):
     # to attach these models
     if asr_model is None and mt_model is None:
         model = model_class(idim, odim, args)
+    elif mt_model is None:
+        model = asr_model
     else:
         model = model_class(idim, odim, args, asr_model=asr_model, mt_model=mt_model)
     assert isinstance(model, ASRInterface)
@@ -337,6 +348,9 @@ def train(args):
         del asr_model
     if args.mt_model:
         del mt_model
+
+    if args.slu_model and args.slu_loss:
+        model.add_slu(args.slu_model, args.slu_loss, args.slu_tune_weights, args.slu_pooling)
 
     if args.rnnlm is not None:
         rnnlm_args = get_model_conf(args.rnnlm, args.rnnlm_conf)
@@ -371,6 +385,8 @@ def train(args):
     device = torch.device("cuda" if args.ngpu > 0 else "cpu")
     model = model.to(device)
 
+    scheduler = None
+
     # Setup an optimizer
     if args.opt == 'adadelta':
         optimizer = torch.optim.Adadelta(
@@ -382,6 +398,16 @@ def train(args):
     elif args.opt == 'noam':
         from espnet.nets.pytorch_backend.transformer.optimizer import get_std_opt
         optimizer = get_std_opt(model, args.adim, args.transformer_warmup_steps, args.transformer_lr)
+    elif args.opt == 'adamw':
+        from transformers import AdamW, WarmupLinearSchedule
+        # Prepare optimizer and schedule (linear warmup and decay)
+        no_decay = ['bias', 'LayerNorm.weight']
+        optimizer_grouped_parameters = [
+            {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+             'weight_decay': 0.0},
+            {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
+        ]
+        optimizer = AdamW(optimizer_grouped_parameters, lr=5e-5, eps=1e-8)
     else:
         raise NotImplementedError("unknown optimizer: " + args.opt)
 
@@ -455,6 +481,8 @@ def train(args):
     if use_sortagrad:
         trainer.extend(ShufflingEnabler([train_iter]),
                        trigger=(args.sortagrad if args.sortagrad != -1 else args.epochs, 'epoch'))
+    if scheduler:
+        trainer.extend(scheduler.step(), name='transformer_warmup')
 
     # Resume from a snapshot
     if args.resume:
@@ -499,7 +527,7 @@ def train(args):
                        trigger=training.triggers.MaxValueTrigger('validation/main/acc'))
 
     # save snapshot which contains model and optimizer states
-    trainer.extend(torch_snapshot(), trigger=(1, 'epoch'))
+    trainer.extend(torch_snapshot())
 
     # epsilon decay in the optimizer
     if args.opt == 'adadelta':
@@ -561,6 +589,7 @@ def recog(args):
     model, train_args = load_trained_model(args.model)
     assert isinstance(model, ASRInterface)
     model.recog_args = args
+    model.eval()
 
     # read rnnlm
     if args.rnnlm:
@@ -665,11 +694,20 @@ def recog(args):
                 names = [name for name in names if name]
                 batch = [(name, js[name]) for name in names]
                 feats = load_inputs_and_targets(batch)[0]
-                nbest_hyps = model.recognize_batch(feats, args, train_args.char_list, rnnlm=rnnlm)
+                if train_args.slu_model:
+                    xs = feats
+                    ilens = np.fromiter((xx.shape[0] for xx in xs), dtype=np.int64)
+                    xs = [to_device(model, to_torch_tensor(xx).float()) for xx in xs]
+                    xs_pad = pad_list(xs, 0.0)
+                    embeddings = model(xs_pad, ilens, None).cpu().numpy()
+                    for i in range(len(batch)):
+                        new_js[batch[i][0]] = embeddings[i].tolist()
+                else:
+                    nbest_hyps = model.recognize_batch(feats, args, train_args.char_list, rnnlm=rnnlm)
 
-                for i, nbest_hyp in enumerate(nbest_hyps):
-                    name = names[i]
-                    new_js[name] = add_results_to_json(js[name], nbest_hyp, train_args.char_list)
+                    for i, nbest_hyp in enumerate(nbest_hyps):
+                        name = names[i]
+                        new_js[name] = add_results_to_json(js[name], nbest_hyp, train_args.char_list)
 
     with open(args.result_label, 'wb') as f:
         f.write(json.dumps({'utts': new_js}, indent=4, ensure_ascii=False, sort_keys=True).encode('utf_8'))

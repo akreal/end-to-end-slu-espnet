@@ -13,6 +13,7 @@ from espnet.nets.pytorch_backend.ctc import CTC
 from espnet.nets.pytorch_backend.e2e_asr import CTC_LOSS_THRESHOLD
 from espnet.nets.pytorch_backend.e2e_asr import Reporter
 from espnet.nets.pytorch_backend.nets_utils import make_pad_mask
+from espnet.nets.pytorch_backend.nets_utils import to_device
 from espnet.nets.pytorch_backend.nets_utils import th_accuracy
 from espnet.nets.pytorch_backend.transformer.attention import MultiHeadedAttention
 from espnet.nets.pytorch_backend.transformer.decoder import Decoder
@@ -136,6 +137,71 @@ class E2E(ASRInterface, torch.nn.Module):
             self.error_calculator = None
         self.rnnlm = None
 
+    def unfreeze_layers(self, slu_tune_weights):
+        if slu_tune_weights == '':
+            return
+
+        tuned_models = []
+
+        for item in slu_tune_weights.split('+'):
+            n = int(item[3:])
+
+            if n > 0:
+                if item[:3] == 'asr':
+                    tuned_models += self.encoder.encoders[-n:]
+                elif item[:3] == 'slu' and hasattr(self.slu, 'encoder'):
+                    tuned_models += self.slu.encoder.layer[:n]
+                elif item[:3] == 'emb':
+                    tuned_models += [self.encoder.embed]
+            elif n < 0:
+                n = n * -1
+                if item[:3] == 'asr':
+                    tuned_models += self.encoder.encoders[:n]
+                elif item[:3] == 'slu' and hasattr(self.slu, 'encoder'):
+                    tuned_models += self.slu.encoder.layer[-n:]
+                elif item[:3] == 'emb':
+                    tuned_models += [self.encoder.embed]
+
+        for tuned_model in tuned_models:
+            for parameter in tuned_model.parameters():
+                parameter.requires_grad = True
+
+    def add_slu(self, slu_model, slu_loss, slu_tune_weights, slu_pooling):
+        if slu_model == 'none':
+            self.slu = torch.nn.Identity()
+            self.slu_mapper = torch.nn.Linear(self.adim, 768)
+        else:
+            if 'nli' in slu_model:
+                from sentence_transformers import SentenceTransformer
+                self.slu = SentenceTransformer(slu_model)[0].bert
+            else:
+                from transformers import AutoModel
+                self.slu = AutoModel.from_pretrained(slu_model)
+            del(self.slu.embeddings)
+            self.slu_mapper = torch.nn.Linear(self.adim, self.slu.config.hidden_size)
+
+        del(self.decoder)
+
+        for parameter in self.parameters():
+            parameter.requires_grad = False
+
+        self.unfreeze_layers(slu_tune_weights)
+
+        self.slu_loss = getattr(torch.nn.functional, slu_loss)
+
+        if slu_loss == 'cosine_embedding_loss':
+            self.slu_loss_label = True
+        else:
+            self.slu_loss_label = False
+
+        if slu_pooling != '':
+            kernel_size = int(slu_pooling[3:])
+
+            if slu_pooling[:3] == 'max':
+                self.slu_pooler = torch.nn.MaxPool1d(kernel_size)
+            elif slu_pooling[:3] == 'avg':
+                self.slu_pooler = torch.nn.AvgPool1d(kernel_size)
+
     def reset_parameters(self, args):
         # initialize parameters
         initialize(self, args.transformer_init)
@@ -172,6 +238,36 @@ class E2E(ASRInterface, torch.nn.Module):
         src_mask = (~make_pad_mask(ilens.tolist())).to(xs_pad.device).unsqueeze(-2)
         hs_pad, hs_mask = self.encoder(xs_pad, src_mask)
         self.hs_pad = hs_pad
+
+        if self.slu_loss is not None:
+            if hasattr(self, 'slu_pooler'):
+                hs_pad = self.slu_pooler(hs_pad.permute(0, 2, 1)).permute(0, 2, 1)
+
+            hidden_state_mapped = self.slu_mapper(hs_pad)
+
+            if hasattr(self.slu, 'encoder'):
+                attention_mask = to_device(self, torch.ones(hidden_state_mapped.shape[0], hidden_state_mapped.shape[1]))
+                extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+                extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+
+                head_mask = [None] * self.slu.config.num_hidden_layers
+                encoded_layers = self.slu.encoder(hidden_state_mapped,
+                                                    extended_attention_mask,
+                                                    head_mask)
+                embeddings = torch.mean(encoded_layers[0], 1)
+            else:
+                embeddings = torch.mean(hidden_state_mapped, 1)
+
+            if ys_pad is None:
+                return embeddings
+            else:
+                if self.slu_loss_label:
+                    self.loss = self.slu_loss(embeddings, ys_pad.squeeze(1), to_device(self, torch.ones(embeddings.size(0))))
+                else:
+                    self.loss = self.slu_loss(embeddings, ys_pad.squeeze(1))
+
+                self.reporter.report(0.0, 0.0, 0.0, 100.0, 100.0, 100.0, float(self.loss))
+                return self.loss
 
         # 2. forward decoder
         ys_in_pad, ys_out_pad = self.add_sos_eos(ys_pad)

@@ -1,5 +1,7 @@
 This is custom fork of ESPnet for the paper [Pretrained Semantic Speech Embeddings for End-to-End Spoken Language Understanding via Cross-Modal Teacher-Student Learning](https://arxiv.org/abs/2007.01836).
 
+Pre-trained model is available [here](https://drive.google.com/file/d/1b67Fn-l4cP8WAsOk_R56dtwOfXdp1J52/view?usp=sharing).
+
 ---
 
 
